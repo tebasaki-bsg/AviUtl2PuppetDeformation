@@ -175,9 +175,10 @@ private:
 	LRESULT handle(UINT msg, WPARAM wp, LPARAM lp);
 
 	// データ
-	void commit();
+	bool commit();  // 戻り値 : 本体に保存できたら true
 public:
 	void undo();
+	void redo();
 	HWND editControl() const { return edit_; }
 private:
 	void requestImage();
@@ -233,7 +234,10 @@ private:
 	Doc doc_;
 	Doc committed_;                 // 本体に保存済みの状態
 	bool hasCommitted_ = false;
-	std::unique_ptr<Doc> undoDoc_;  // 直前の操作の前の状態 (Ctrl+Z で1つだけ戻す)
+	// 元に戻す (Ctrl+Z) とやり直し (Ctrl+Y) の記録。各要素は1回の操作の前 (やり直しは後) の状態
+	static constexpr size_t kMaxUndo = 100;
+	std::vector<Doc> undoStack_, redoStack_;
+	bool restoreDoc(const Doc& src);
 	bool undoing_ = false;
 	SectionInfo sec_;
 	bool found_ = false;
@@ -378,8 +382,11 @@ void Editor::reload() {
 	d.normalize();
 	doc_ = std::move(d);
 	loaded_ = true;
-	// 本体側で変更された(自分の保存以外)場合は、元に戻す対象を破棄する
-	if (hasCommitted_ && serialize(doc_) != serialize(committed_)) undoDoc_.reset();
+	// 本体側で変更された(自分の保存以外)場合は、元に戻す・やり直しの記録を破棄する
+	if (hasCommitted_ && serialize(doc_) != serialize(committed_)) {
+		undoStack_.clear();
+		redoStack_.clear();
+	}
 	committed_ = doc_;
 	hasCommitted_ = true;
 	if (selPin_ >= (int)doc_.pins.size()) selPin_ = doc_.pins.empty() ? -1 : (int)doc_.pins.size() - 1;
@@ -397,14 +404,14 @@ void Editor::reload() {
 }
 
 // ---- データの保存 (1回の操作 = 1回の元に戻す) ----
-void Editor::commit() {
-	if (!g_edit || !found_) return;
+bool Editor::commit() {
+	if (!g_edit || !found_) return false;
 	doc_.normalize();
 	for (size_t i = 0; i < doc_.poses.size() && i < sec_.pointFrames.size(); i++) doc_.poses[i].frame = sec_.pointFrames[i];
 	if (serialize(doc_).size() > kMaxBlob) {
 		MessageBoxW(hwnd_, L"保存できるデータの容量を超えました。ピン・ボーン・中間点の数を減らしてください。", kEffectName, MB_OK | MB_ICONWARNING);
 		reload();
-		return;
+		return false;
 	}
 	struct Ctx {
 		Editor* self;
@@ -421,18 +428,41 @@ void Editor::commit() {
 	if (!called || !ctx.ok) {
 		status_ = L"変更を保存できませんでした（再生中・出力中などは編集できません）";
 		reload();
-		return;
+		return false;
 	}
-	if (!undoing_ && hasCommitted_) undoDoc_ = std::make_unique<Doc>(committed_);
+	if (!undoing_ && hasCommitted_ && serialize(doc_) != serialize(committed_)) {
+		undoStack_.push_back(committed_);
+		if (undoStack_.size() > kMaxUndo) undoStack_.erase(undoStack_.begin());
+		redoStack_.clear();
+	}
 	committed_ = doc_;
 	hasCommitted_ = true;
+	return true;
 }
 
-// 直前の1操作だけを取り消す (ドラッグはドラッグを始める前の状態へ)
+// 操作を1つ取り消す (ドラッグはドラッグを始める前の状態へ)。最大 kMaxUndo 回
 void Editor::undo() {
-	if (!undoDoc_ || drag_ != Drag::None || !found_) return;
+	if (undoStack_.empty() || drag_ != Drag::None || !found_) return;
 	if (edit_ && IsWindowVisible(edit_)) endTextEdit(false);
-	Doc d = *undoDoc_;
+	const Doc before = committed_;
+	if (!restoreDoc(undoStack_.back())) return;  // 保存できなければ記録はそのまま
+	undoStack_.pop_back();
+	redoStack_.push_back(before);
+}
+
+// 取り消した操作を1つやり直す
+void Editor::redo() {
+	if (redoStack_.empty() || drag_ != Drag::None || !found_) return;
+	if (edit_ && IsWindowVisible(edit_)) endTextEdit(false);
+	const Doc before = committed_;
+	if (!restoreDoc(redoStack_.back())) return;
+	redoStack_.pop_back();
+	undoStack_.push_back(before);
+	if (undoStack_.size() > kMaxUndo) undoStack_.erase(undoStack_.begin());
+}
+
+bool Editor::restoreDoc(const Doc& src) {
+	Doc d = src;
 	d.poses = mapPoses(d, sec_.pointFrames);
 	d.normalize();
 	doc_ = std::move(d);
@@ -440,11 +470,11 @@ void Editor::undo() {
 	if (selBone_ >= (int)doc_.bones.size()) selBone_ = -1;
 	if (!cutSelected()) selCut_ = selCutPt_ = -1;
 	undoing_ = true;
-	commit();
+	const bool ok = commit();
 	undoing_ = false;
-	undoDoc_.reset();
 	layout();
 	InvalidateRect(hwnd_, nullptr, FALSE);
+	return ok;
 }
 
 void Editor::requestImage() {
@@ -1658,6 +1688,7 @@ void Editor::onLButtonDown(int x, int y, WPARAM) {
 			drag_ = Drag::Number;
 			dragWidget_ = i;
 			dragStartX_ = x;
+			dragStartY_ = y;  // 前のドラッグの値が残っていると、動かさずに離してもドラッグ扱いになり、直接入力にならなかった
 			dragStartValue_ = getField(w.field, w.side);
 			dragMoved_ = false;
 			SetCapture(hwnd_);
@@ -2009,10 +2040,20 @@ LRESULT Editor::handle(UINT msg, WPARAM wp, LPARAM lp) {
 			if (wp) requestImage();
 			return 0;
 		case WM_PD_IMAGE: takeImage(); return 0;
-		case WM_PD_UNDO: undo(); return 0;
-		case WM_KEYDOWN:
-			if (wp == 'Z' && (GetKeyState(VK_CONTROL) & 0x8000) && !(GetKeyState(VK_SHIFT) & 0x8000)) {
+		case WM_PD_UNDO:
+			if (wp) {
+				redo();
+			} else {
 				undo();
+			}
+			return 0;
+		case WM_KEYDOWN:
+			if ((wp == 'Z' || wp == 'Y') && (GetKeyState(VK_CONTROL) & 0x8000) && !(GetKeyState(VK_SHIFT) & 0x8000)) {
+				if (wp == 'Z') {
+					undo();
+				} else {
+					redo();
+				}
 				return 0;
 			}
 			break;
@@ -2071,11 +2112,11 @@ void openEditor(const TargetRef& target) {
 	updateKeyboardHook();
 }
 
-// 本体のショートカット処理より先に Ctrl+Z を受け取るため、メインスレッドにキーボードフックを置く
+// 本体のショートカット処理より先に Ctrl+Z / Ctrl+Y を受け取るため、メインスレッドにキーボードフックを置く
 HHOOK g_kbHook = nullptr;
 
 LRESULT CALLBACK keyboardHook(int code, WPARAM wp, LPARAM lp) {
-	if (code == HC_ACTION && wp == 'Z' && (GetKeyState(VK_CONTROL) & 0x8000) && !(GetKeyState(VK_SHIFT) & 0x8000) &&
+	if (code == HC_ACTION && (wp == 'Z' || wp == 'Y') && (GetKeyState(VK_CONTROL) & 0x8000) && !(GetKeyState(VK_SHIFT) & 0x8000) &&
 		!(GetKeyState(VK_MENU) & 0x8000)) {
 		HWND fg = GetForegroundWindow();
 		for (auto& kv : g_editors) {
@@ -2083,8 +2124,8 @@ LRESULT CALLBACK keyboardHook(int code, WPARAM wp, LPARAM lp) {
 			if (GetFocus() == kv.second->editControl()) break;  // 数値の入力中は入力欄の取り消し
 			const bool keyDown = !(lp & 0x80000000);
 			const bool repeat = (lp & 0x40000000) != 0;
-			if (keyDown && !repeat) PostMessageW(fg, WM_PD_UNDO, 0, 0);
-			return 1;  // 本体の「元に戻す」には渡さない
+			if (keyDown && !repeat) PostMessageW(fg, WM_PD_UNDO, wp == 'Y' ? 1 : 0, 0);
+			return 1;  // 本体の「元に戻す」「やり直し」には渡さない
 		}
 	}
 	return CallNextHookEx(g_kbHook, code, wp, lp);

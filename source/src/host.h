@@ -103,7 +103,7 @@ constexpr UINT WM_PD_OPEN = WM_APP + 0x101;     // lParam = TargetRef* (メッ�
 constexpr UINT WM_PD_EVENT = WM_APP + 0x102;    // wParam = EVENT_TYPE (メッセージ用ウィンドウ宛て)
 constexpr UINT WM_PD_RELOAD = WM_APP + 0x103;   // 編集ウィンドウ宛て : データを読み直す
 constexpr UINT WM_PD_IMAGE = WM_APP + 0x104;    // 編集ウィンドウ宛て : 画像が届いた
-constexpr UINT WM_PD_UNDO = WM_APP + 0x105;     // 編集ウィンドウ宛て : 直前の操作を取り消す
+constexpr UINT WM_PD_UNDO = WM_APP + 0x105;     // 編集ウィンドウ宛て : 操作を1つ取り消す (wParam = 1 ならやり直し)
 extern HWND g_msgWnd;
 
 // エフェクトが同じオブジェクト内で何番目のパペット変形か (1から)
