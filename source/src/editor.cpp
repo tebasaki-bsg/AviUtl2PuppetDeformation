@@ -601,6 +601,7 @@ void Editor::takeImage() {
 				}
 			}
 			contour_.area *= (W / mw) * (H / mh);
+			contour_.src.reset();  // 座標を書き換えたので、粗い段階は作らない (表示と端の判定に使うだけ)
 		}
 	}
 	const bool sizeChanged = std::fabs((r - l) - conW()) > 0.5 || std::fabs((btm - t) - conH()) > 0.5;

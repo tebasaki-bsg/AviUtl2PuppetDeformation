@@ -15,7 +15,7 @@ namespace {
 
 COMMON_PLUGIN_TABLE g_commonTable = {
 	L"パペット変形",
-	L"パペット変形 for AviUtl2 v1.0.0 - ピンとボーンで画像を変形",
+	L"パペット変形 for AviUtl2 v1.0.1 - ピンとボーンで画像を変形",
 };
 
 ULONG_PTR g_gdiplusToken = 0;

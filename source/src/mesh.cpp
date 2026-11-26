@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <numeric>
 #include <unordered_map>
 #include <unordered_set>
@@ -586,69 +588,138 @@ bool Contour::inside(const Vec2& p) const {
 	return c;
 }
 
-bool buildContour(int w, int h, const uint8_t* alpha, Contour& out, int maxSide) {
-	out = Contour{};
-	if (w <= 0 || h <= 0 || !alpha) return false;
-	const int L = std::max(w, h);
-	maxSide = std::max(16, maxSide);
-	const double s = L > maxSide ? (double)maxSide / L : 1.0;
-	const int mw = std::max(1, (int)std::ceil(w * s));
-	const int mh = std::max(1, (int)std::ceil(h * s));
-	std::vector<uint8_t> m((size_t)mw * mh, 0);
-	bool any = false;
-	for (int y = 0; y < h; y++) {
-		const uint8_t* row = alpha + (size_t)y * w;
-		uint8_t* dst = m.data() + (size_t)std::min(mh - 1, (int)(y * s)) * mw;
-		if (s == 1.0) {
-			for (int x = 0; x < w; x++) {
-				if (row[x]) {
-					dst[x] = 1;
-					any = true;
+// ---------------------------------------------------------------------------
+// 輪郭 (パペット変形改 v1.0.1 の AlphaOutline と同じ作り)
+
+// 粗い段階を作り直すための元の情報 (縮めた後の不透明かどうかと、小さな島の印)
+struct ContourSource {
+	std::vector<uint8_t> mask;  // 0 : 透明、1 : 大きなかたまり、2 : 小さな島 (段階 1 以上を作るときに印を付ける)
+	int mw = 0, mh = 0;         // 縮めた後の大きさ
+	int w = 0, h = 0;           // 元の大きさ
+	double s = 1;               // 縮めた倍率
+	bool labeled = false;
+	std::mutex mu;
+	std::vector<std::unique_ptr<Contour>> levels;  // 作った粗い段階 (番号 = 段階)
+};
+
+namespace {
+
+// 粗さの段階 : (間引く基準, 大きなかたまりを広げる幅, 小さな島を広げる幅) (縮めた後の画素)
+// 広げる幅は間引く基準より 0.5 画素以上大きくし、間引いても不透明な画素が輪郭の外に出ないようにする
+// 小さな島は大きく広げて近くの島どうしをまとめ、島の数 (= 輪郭の数) を減らす
+struct LevelSpec {
+	double tol;
+	int big, small;
+};
+constexpr LevelSpec kLevels[] = { { 1.5, 2, 2 }, { 2.5, 3, 6 }, { 4, 5, 12 }, { 6.5, 8, 24 }, { 10, 12, 48 }, { 16, 18, 96 } };
+constexpr int kMaxLevel = (int)(sizeof(kLevels) / sizeof(kLevels[0])) - 1;
+constexpr int kSmallIslandPixels = 64;  // この面積 (画素) 以下の不透明なかたまりを「小さな島」とする (ほぼ透明な点・消し残りなど)
+
+// 正方形で r 画素広げる (横 → 縦)
+std::vector<uint8_t> dilateSquare(const std::vector<uint8_t>& m, int W, int H, int r) {
+	std::vector<uint8_t> t((size_t)W * H, 0), d((size_t)W * H, 0);
+	for (int y = 0; y < H; y++) {
+		const uint8_t* src = m.data() + (size_t)y * W;
+		uint8_t* dst = t.data() + (size_t)y * W;
+		int run = -1;
+		for (int x = 0; x < W; x++) {
+			if (src[x]) run = x;
+			if (run >= 0 && x - run <= r) dst[x] = 1;
+		}
+		run = -1;
+		for (int x = W - 1; x >= 0; x--) {
+			if (src[x]) run = x;
+			if (run >= 0 && run - x <= r) dst[x] = 1;
+		}
+	}
+	for (int x = 0; x < W; x++) {
+		int run = -1;
+		for (int y = 0; y < H; y++) {
+			if (t[(size_t)y * W + x]) run = y;
+			if (run >= 0 && y - run <= r) d[(size_t)y * W + x] = 1;
+		}
+		run = -1;
+		for (int y = H - 1; y >= 0; y--) {
+			if (t[(size_t)y * W + x]) run = y;
+			if (run >= 0 && run - y <= r) d[(size_t)y * W + x] = 1;
+		}
+	}
+	return d;
+}
+
+// 不透明な画素のかたまり (8連結) のうち、面積が kSmallIslandPixels 以下のものの印を 2 にする
+void markSmallIslands(std::vector<uint8_t>& mask, int w, int h) {
+	std::vector<uint8_t> seen(mask.size(), 0);
+	std::vector<int> stack, members;
+	for (size_t start = 0; start < mask.size(); start++) {
+		if (!mask[start] || seen[start]) continue;
+		members.clear();
+		seen[start] = 1;
+		stack.push_back((int)start);
+		bool tooBig = false;
+		while (!stack.empty()) {
+			const int i = stack.back();
+			stack.pop_back();
+			if (!tooBig) {
+				members.push_back(i);
+				if ((int)members.size() > kSmallIslandPixels) tooBig = true;
+			}
+			const int x = i % w, y = i / w;
+			for (int dy = -1; dy <= 1; dy++) {
+				for (int dx = -1; dx <= 1; dx++) {
+					const int nx = x + dx, ny = y + dy;
+					if ((dx | dy) == 0 || nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+					const int j = ny * w + nx;
+					if (!mask[j] || seen[j]) continue;
+					seen[j] = 1;
+					stack.push_back(j);
 				}
 			}
-		} else {
-			for (int x = 0; x < w; x++) {
-				if (row[x]) {
-					dst[std::min(mw - 1, (int)(x * s))] = 1;
-					any = true;
-				}
+		}
+		if (!tooBig) {
+			for (int i : members) mask[i] = 2;
+		}
+	}
+}
+
+// 段階 level の輪郭を作る。広げた分は画像の外にもはみ出す (はみ出さないと、間引いたときに画像の端の不透明な画素が輪郭の外に出る)
+void buildLevel(const ContourSource& src, int level, Contour& out) {
+	out = Contour{};
+	out.level = level;
+	LevelSpec L = kLevels[level];
+	if (!src.labeled) L.small = L.big;  // 段階 0 : 小さな島も同じ幅
+	const int pad = std::max(L.big, L.small) + 1;
+	const int W = src.mw + 2 * pad, H = src.mh + 2 * pad;
+	std::vector<uint8_t> big((size_t)W * H, 0), small;
+	if (L.small != L.big) small.assign((size_t)W * H, 0);
+	for (int y = 0; y < src.mh; y++) {
+		for (int x = 0; x < src.mw; x++) {
+			const uint8_t v = src.mask[(size_t)y * src.mw + x];
+			if (!v) continue;
+			const size_t k = (size_t)(y + pad) * W + (x + pad);
+			if (v == 2 && !small.empty()) {
+				small[k] = 1;
+			} else {
+				big[k] = 1;
 			}
 		}
 	}
-	if (!any) return false;
-	// 2px 広げる (3x3 を2回。画像の範囲内まで)
-	for (int pass = 0; pass < 2; pass++) {
-		std::vector<uint8_t> src = m;
-		for (int y = 0; y < mh; y++) {
-			for (int x = 0; x < mw; x++) {
-				if (src[(size_t)y * mw + x]) continue;
-				bool on = false;
-				for (int dy = -1; dy <= 1 && !on; dy++) {
-					const int yy = y + dy;
-					if (yy < 0 || yy >= mh) continue;
-					for (int dx = -1; dx <= 1; dx++) {
-						const int xx = x + dx;
-						if (xx >= 0 && xx < mw && src[(size_t)yy * mw + xx]) {
-							on = true;
-							break;
-						}
-					}
-				}
-				if (on) m[(size_t)y * mw + x] = 1;
-			}
-		}
+	std::vector<uint8_t> m = dilateSquare(big, W, H, L.big);
+	if (!small.empty()) {
+		const std::vector<uint8_t> ds = dilateSquare(small, W, H, L.small);
+		for (size_t i = 0; i < m.size(); i++) m[i] |= ds[i];
 	}
 	size_t cnt = 0;
 	for (auto v : m) cnt += v;
-	out.area = cnt / (s * s);
+	out.area = cnt / (src.s * src.s);
 
 	// 画素の境目の辺 (不透明な側を右に見る向き)。方向 : 0=+x 1=+y 2=-x 3=-y
-	const int VW = mw + 1;
-	std::vector<uint8_t> outMask((size_t)VW * (mh + 1), 0), used((size_t)VW * (mh + 1), 0);
-	auto in = [&](int i, int j) { return i >= 0 && j >= 0 && i < mw && j < mh && m[(size_t)j * mw + i]; };
-	for (int j = 0; j < mh; j++) {
-		for (int i = 0; i < mw; i++) {
-			if (!m[(size_t)j * mw + i]) continue;
+	const int VW = W + 1;
+	std::vector<uint8_t> outMask((size_t)VW * (H + 1), 0), used((size_t)VW * (H + 1), 0);
+	auto in = [&](int i, int j) { return i >= 0 && j >= 0 && i < W && j < H && m[(size_t)j * W + i]; };
+	for (int j = 0; j < H; j++) {
+		for (int i = 0; i < W; i++) {
+			if (!m[(size_t)j * W + i]) continue;
 			if (!in(i, j - 1)) outMask[(size_t)j * VW + i] |= 1;
 			if (!in(i + 1, j)) outMask[(size_t)j * VW + i + 1] |= 2;
 			if (!in(i, j + 1)) outMask[(size_t)(j + 1) * VW + i + 1] |= 4;
@@ -679,30 +750,130 @@ bool buildContour(int w, int h, const uint8_t* alpha, Contour& out, int maxSide)
 				if (nd < 0 || (used[v] & (1 << nd))) break;
 				d = nd;
 			}
-			auto simp = simplifyLoop(loop, 0.75);
+			auto simp = simplifyLoop(loop, L.tol);
 			if (simp.size() < 3) continue;
 			for (auto& p : simp) {
-				p.x = p.x / s - w * 0.5;
-				p.y = p.y / s - h * 0.5;
+				p.x = (p.x - pad) / src.s - src.w * 0.5;
+				p.y = (p.y - pad) / src.s - src.h * 0.5;
 			}
 			out.loops.push_back(std::move(simp));
 		}
 	}
+}
+
+size_t contourPoints(const Contour& c) {
+	size_t n = 0;
+	for (auto& l : c.loops) n += l.size();
+	return n;
+}
+
+}  // namespace
+
+bool buildContour(int w, int h, const uint8_t* alpha, Contour& out, int maxSide) {
+	out = Contour{};
+	if (w <= 0 || h <= 0 || !alpha) return false;
+	const int L = std::max(w, h);
+	maxSide = std::max(16, maxSide);
+	auto src = std::make_shared<ContourSource>();
+	src->w = w;
+	src->h = h;
+	src->s = L > maxSide ? (double)maxSide / L : 1.0;
+	const double s = src->s;
+	const int mw = src->mw = std::max(1, (int)std::ceil(w * s));
+	const int mh = src->mh = std::max(1, (int)std::ceil(h * s));
+	std::vector<uint8_t>& m = src->mask;
+	m.assign((size_t)mw * mh, 0);
+	bool any = false;
+	for (int y = 0; y < h; y++) {
+		const uint8_t* row = alpha + (size_t)y * w;
+		uint8_t* dst = m.data() + (size_t)std::min(mh - 1, (int)(y * s)) * mw;
+		if (s == 1.0) {
+			for (int x = 0; x < w; x++) {
+				if (row[x]) {
+					dst[x] = 1;
+					any = true;
+				}
+			}
+		} else {
+			for (int x = 0; x < w; x++) {
+				if (row[x]) {
+					dst[std::min(mw - 1, (int)(x * s))] = 1;
+					any = true;
+				}
+			}
+		}
+	}
+	if (!any) return false;
+	buildLevel(*src, 0, out);
+	out.src = std::move(src);
 	return !out.loops.empty();
 }
+
+const Contour* coarserContour(const Contour& base, int level) {
+	if (!base.src || level <= 0 || level > kMaxLevel) return nullptr;
+	ContourSource& src = *base.src;
+	std::lock_guard<std::mutex> lock(src.mu);
+	if ((int)src.levels.size() <= level) src.levels.resize(level + 1);
+	if (!src.levels[level]) {
+		if (!src.labeled) {
+			markSmallIslands(src.mask, src.mw, src.mh);
+			src.labeled = true;
+		}
+		auto c = std::make_unique<Contour>();
+		buildLevel(src, level, *c);
+		src.levels[level] = std::move(c);
+	}
+	return src.levels[level].get();
+}
+
+int maxContourLevel() { return kMaxLevel; }
 
 bool buildMesh(const Contour& contour, const std::vector<std::vector<Vec2>>& cuts, const MeshParams& params, TriMesh& out) {
 	out = TriMesh{};
 	if (contour.empty() || contour.area <= 0) return false;
-	double h = std::max(params.minSpacing, std::sqrt(4.0 * contour.area / (std::sqrt(3.0) * std::max(1, params.targetTris))));
-	for (int attempt = 0; attempt < 8; attempt++) {
+	auto baseSpacing = [&](const Contour& c) {
+		return std::max(params.minSpacing, std::sqrt(4.0 * c.area / (std::sqrt(3.0) * std::max(1, std::min(params.maxTris, params.targetTris)))));
+	};
+	// 三角形が上限を超えるときは、まず輪郭のほうを粗くする (パペット変形改 v1.0.1 と同じ)。
+	// 内側の間隔だけを広げると、縁だけ細かく内側が粗いいびつな網目になり、計算がとても重くなる
+	const Contour* o = &contour;
+	int level = contour.level;
+	auto next = [&]() -> const Contour* {
+		const Contour* c = coarserContour(contour, level + 1);
+		if (!c || c->empty() || c->area <= 0) return nullptr;
+		level++;
+		return c;
+	};
+	while (true) {
+		// 輪郭の点だけで上限の 3/4 を超えるなら、網目を作るまでもなく超える (作ると何秒もかかる) ので先に粗くする
+		if ((int)contourPoints(*o) > params.maxTris * 3 / 4) {
+			if (const Contour* c = next()) {
+				o = c;
+				continue;
+			}
+		}
 		TriMesh m;
-		if (!buildOnce(contour, cuts, h, m)) return false;
-		if ((int)m.tris.size() <= params.maxTris || attempt == 7) {
+		if (!buildOnce(*o, cuts, baseSpacing(*o), m)) return false;
+		if ((int)m.tris.size() <= params.maxTris) {
+			m.contourLevel = level;
 			out = std::move(m);
 			return true;
 		}
-		h *= std::sqrt((double)m.tris.size() / params.targetTris) * 1.05;
+		const Contour* c = next();
+		if (!c) break;
+		o = c;
+	}
+	// いちばん粗い輪郭でも超えるときだけ、内側の間隔を広げる
+	double h = baseSpacing(*o);
+	for (int attempt = 0; attempt < 13; attempt++) {
+		h *= 1.12;
+		TriMesh m;
+		if (!buildOnce(*o, cuts, h, m)) return false;
+		if ((int)m.tris.size() <= params.maxTris || attempt == 12) {
+			m.contourLevel = level;
+			out = std::move(m);
+			return true;
+		}
 	}
 	return false;
 }

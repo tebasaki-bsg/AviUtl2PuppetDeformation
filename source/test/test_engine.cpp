@@ -2,11 +2,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <random>
 #include <cstring>
 #include <string>
 #include <vector>
 
 #include "../src/deform.h"
+#include "../src/mesh.h"
 #include "../src/model.h"
 
 using namespace pd;
@@ -517,6 +519,90 @@ int main(int argc, char** argv) {
 				auto t1 = std::chrono::steady_clock::now();
 				std::printf("       1920x1080 制御点%zu個 %s %s: %.1f ms\n", hs.size(), m == Method::ARAP ? "ARAP" : "MLS ",
 							rep == 0 ? "初回" : "2回目", std::chrono::duration<double, std::milli>(t1 - t0).count());
+			}
+		}
+	}
+
+	// ---- 輪郭の細かい画像・ほぼ透明な点の散らばった画像 (v1.0.0 で追加。パペット変形改 v1.0.1 と同じ直し方) ----
+	{
+		auto P = [](double x, double y, double cx, double cy) {
+			Handle h;
+			h.rest = { x, y };
+			h.cur = { cx, cy };
+			return h;
+		};
+		// 不透明な画素のうち、網目のどの三角形にも入っていないものの数
+		auto uncovered = [](const TriMesh& m, const std::vector<uint8_t>& a, int W, int H) {
+			TriLocator loc;
+			loc.build(m);
+			const std::vector<std::vector<Vec2>> nc;
+			int bad = 0;
+			for (int y = 0; y < H; y++) {
+				for (int x = 0; x < W; x++) {
+					if (!a[(size_t)y * W + x]) continue;
+					std::array<double, 3> b{};
+					const int t = loc.locate({ x + 0.5 - W / 2.0, y + 0.5 - H / 2.0 }, nc, b);
+					if (t < 0 || b[0] < -1e-6 || b[1] < -1e-6 || b[2] < -1e-6) bad++;
+				}
+			}
+			return bad;
+		};
+		auto run = [&](const char* name, const std::vector<uint8_t>& a, int W, int H, const std::vector<Handle>& hs, int& level) {
+			const std::vector<std::vector<Vec2>> nc;
+			TriDeformer td;
+			TriResult r;
+			auto t0 = std::chrono::steady_clock::now();
+			const bool ok = td.deform(W, H, a.data(), nc, hs, Method::ARAP, 2, 0.02, r);
+			const double t = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+			const TriMesh& m = td.mesh();
+			level = m.contourLevel;
+			char msg[256];
+			std::snprintf(msg, sizeof msg, "%s : 三角形 %zu 個 (上限 5440)、輪郭の段階 %d", name, m.tris.size(), m.contourLevel);
+			check(ok && (int)m.tris.size() <= 5440, msg);
+			std::snprintf(msg, sizeof msg, "%s : 網目から1回目の変形まで %.0f ms (3 秒未満)", name, t);
+			check(t < 3000, msg);
+			const int u = ok ? uncovered(m, a, W, H) : -1;
+			std::snprintf(msg, sizeof msg, "%s : 不透明な画素はすべて網目の中 (外 %d 画素)", name, u);
+			check(u == 0, msg);
+		};
+		int level = 0;
+		{
+			// 64 本のとげのある星 (縁がすべて斜めで、ぎざぎざが長い)。v0.4.1 までは三角形が上限を超え、間隔が数百 px のいびつな網目になった
+			const int W = 1400, H = 1400;
+			std::vector<uint8_t> a((size_t)W * H, 0);
+			for (int y = 0; y < H; y++) {
+				for (int x = 0; x < W; x++) {
+					const double px = x + 0.5 - W / 2.0, py = y + 0.5 - H / 2.0, ang = std::atan2(py, px);
+					const double rr = 420 + 180 * std::fabs(std::sin(ang * 32)) + 25 * std::sin(ang * 7);
+					if (std::hypot(px, py) < rr) a[(size_t)y * W + x] = 255;
+				}
+			}
+			run("細かい縁", a, W, H, { P(0, 0, 0, 0), P(400, 0, 430, 60), P(-400, 0, -400, 0) }, level);
+		}
+		{
+			// 人の形の外に、ほぼ透明な点 (α=1) が散らばった画像。v0.4.1 までは点の数だけ輪郭ができ、2万個で 17 秒かかった
+			const int W = 600, H = 920;
+			std::vector<uint8_t> human((size_t)W * H, 0);
+			for (int y = 0; y < H; y++) {
+				for (int x = 0; x < W; x++) {
+					const double px = x - 300.0, py = y - 460.0;
+					const bool on = std::hypot(px, py + 330) < 80 || (px * px / (150.0 * 150) + (py + 20) * (py + 20) / (260.0 * 260) < 1) ||
+									(std::fabs(px + 70) < 40 && py > 150 && py < 440) || (std::fabs(px - 70) < 40 && py > 150 && py < 440) ||
+									(std::fabs(py + 120) < 30 && std::fabs(px) < 270);
+					if (on) human[(size_t)y * W + x] = 255;
+				}
+			}
+			for (int count : { 200, 20000 }) {
+				auto a = human;
+				std::mt19937 rnd(1);
+				for (int i = 0; i < count; i++) {
+					const int x = (int)(rnd() % W), y = (int)(rnd() % H);
+					if (!a[(size_t)y * W + x]) a[(size_t)y * W + x] = 1;
+				}
+				char name[64];
+				std::snprintf(name, sizeof name, "ほぼ透明な点 %d 個", count);
+				run(name, a, W, H, { P(0, -330, 0, -330), P(190, -120, 230, -160), P(-70, 380, -70, 380) }, level);
+				if (count == 200) check(level == 0, "点の少ない画像は輪郭の段階 0 のまま");
 			}
 		}
 	}

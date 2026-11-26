@@ -88,7 +88,7 @@ FILTER_PLUGIN_TABLE g_table = {
 	FILTER_PLUGIN_TABLE::FLAG_VIDEO | FILTER_PLUGIN_TABLE::FLAG_USERDATA,
 	kEffectName,
 	L"変形",
-	L"パペット変形 for AviUtl2 v1.0.0",
+	L"パペット変形 for AviUtl2 v1.0.1",
 	g_items,
 	procVideo,
 	nullptr,
